@@ -1,0 +1,9 @@
+langchain
+langchain-groq
+langgraph
+langchain-mcp-adapters
+tavily-python
+groq
+python-dotenv
+langsmith
+notebook

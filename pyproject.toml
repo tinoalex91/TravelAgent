@@ -1,0 +1,20 @@
+[project]
+name = "travel-agent"
+version = "0.1.0"
+description = "LangGraph multi-agent Travel Planner (Coordinator + Flights/Venue/Playlist agents)"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain",
+    "langchain-groq",
+    "langgraph",
+    "langchain-mcp-adapters",
+    "tavily-python",
+    "groq",
+    "python-dotenv",
+    "langsmith",
+    "notebook",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

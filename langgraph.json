@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./travel_agent/graph.py:app",
+    "dynamic_agent": "./travel_agent/graph.py:dynamic_app"
+  },
+  "env": ".env"
+}

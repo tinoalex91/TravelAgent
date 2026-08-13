@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv",
     "langsmith",
     "notebook",
+    "langgraph-cli>=0.4.31",
 ]
 
 [build-system]

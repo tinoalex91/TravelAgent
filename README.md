@@ -203,20 +203,3 @@ cd agent-chat-ui
 npm install
 npm run dev
 ```
-
-Open `http://localhost:3000`. Its `.env` is pre-configured with
-`NEXT_PUBLIC_API_URL=http://127.0.0.1:2024` and `NEXT_PUBLIC_ASSISTANT_ID=dynamic_agent` — edit
-the latter to `agent` to test the fixed pipeline instead, or override it in the app's settings
-screen. Requires `langgraph dev` running separately.
-
-## Notes / known issues
-
-- The Kiwi MCP server currently doesn't expose a `search_flights` tool, so the flights tool
-  runs on its stub fallback by default.
-- Field extraction relies on the LLM returning strict JSON; both graphs have a
-  regex/keyword-based fallback for when it doesn't (`_fallback_extraction` in the fixed
-  pipeline; a plain `{}` fallback in the dynamic planner, which then surfaces as a validation
-  error if no destination was extracted).
-- The sample playlist DB's seed genres are `jazz`/`pop`/`rock`/`electronic` — a request for
-  e.g. `EDM` will correctly call the tool but get "No songs found" back, since the genre string
-  doesn't match. Not a bug in the graph logic, just sparse seed data.

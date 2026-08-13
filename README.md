@@ -2,26 +2,47 @@
 
 A multi-agent travel planning assistant built with **LangGraph**. It takes a single free-text
 request — e.g. *"I'm from Bangalore and I want a hall in Chennai for 100 guests, jazz
-playlist"* — and returns structured results for flights, venue, and playlist by fanning the
-request out to specialized sub-agents.
+playlist"* — and returns structured results for flights, venue, and playlist.
 
-The whole implementation lives in [notebook.ipynb](notebook.ipynb).
+Two graphs implement two different takes on the same problem:
+
+- **`agent`** — a coordinator that extracts intent up front, then runs a **fixed** pipeline
+  (flights → venue → playlist), skipping any step the user didn't ask for.
+- **`dynamic_agent`** — a single **Dynamic Planner Agent** that decides for itself, at runtime,
+  which of the three tools are actually relevant and calls only those — e.g. for *"Small party
+  in Goa with EDM music"* it skips flights (no origin mentioned) and calls only venue +
+  playlist.
+
+## Where the code lives
+
+- [notebook.ipynb](notebook.ipynb) — the annotated, cell-by-cell walkthrough of both
+  architectures. Best place to read *why* each piece exists.
+- [travel_agent/graph.py](travel_agent/graph.py) — the same logic extracted into a plain Python
+  module, importable and servable by `langgraph dev` / the LangGraph API. This is what actually
+  runs when you test the graphs interactively (see [Running & testing](#running--testing)
+  below). Keep the two in sync if you change one.
+- [langgraph.json](langgraph.json) — tells the LangGraph CLI where to find each compiled graph
+  (`agent` and `dynamic_agent`) inside `travel_agent/graph.py`.
+- [agent-chat-ui/](agent-chat-ui/) — a vendored copy of
+  [langchain-ai/agent-chat-ui](https://github.com/langchain-ai/agent-chat-ui), a small Next.js
+  chat frontend, pre-wired via `agent-chat-ui/.env` to talk to a local LangGraph server. Useful
+  for testing without LangGraph Studio.
 
 ## Purpose
 
 Planning a trip or event usually means juggling several unrelated lookups — flights, a venue,
-music for the occasion. This agent shows how to decompose that into a **coordinator +
-specialist** pattern:
+music for the occasion. Both graphs decompose that the same general way:
 
-1. A **coordinator** reads the raw request once and figures out *what* the user is actually
-   asking for (which of flights/venue/playlist apply) and *what parameters* to pass along
-   (origin, destination, guest count, genre).
-2. Each **specialist agent** is scoped to exactly one tool and one job, so it can't do
-   anything else and is easy to reason about, test, and swap out independently.
-3. A shared **graph state** carries the extracted parameters and each specialist's result
-   until a final node assembles them into one structured response.
+1. Figure out *what* the user is actually asking for (which of flights/venue/playlist apply)
+   and *what parameters* to pass along (origin, destination, guest count, genre).
+2. Only run the tools that are relevant — never call flights without an origin, never call
+   venue/playlist without a destination/genre.
+3. Merge whatever results were produced into one structured response.
 
-## Architecture
+They differ in *how* step 2 is decided: a rule-based router walking a fixed order, vs. an agent
+making the call itself.
+
+## Architecture — `agent` (fixed pipeline)
 
 ```
 START
@@ -53,28 +74,56 @@ update_state_node     (parses the JSON, merges fields into state, falls back to 
   Nodes return partial dicts and LangGraph merges them into state — nodes never mutate state
   directly.
 
+## Architecture — `dynamic_agent` (dynamic planner)
+
+```
+User → Pre-Middleware (extract, validate, default) → Dynamic Planner Agent
+     → Tool Executor → Post-Middleware (merge, format) → Final Output
+```
+
+- **Pre-Middleware** (`pre_middleware_node`) — extracts origin/destination/guest_count/genre
+  via the LLM, defaults `guest_count` to 20 if unspecified, and validates that a destination is
+  present (routes straight to an error output otherwise, never invoking the planner).
+- **Dynamic Planner Agent** (`dynamic_planner_agent`) — one `create_agent` with all three tools
+  (`flights_tool`, `search_venues`, `query_playlist_db`) bound directly. It decides itself which
+  tools are relevant to the extracted fields and calls only those.
+- **Tool Executor** — there's no separate node for this; it's the planner agent's own ReAct
+  tool-calling loop (`planner_node` just invokes the agent and captures the resulting message
+  history).
+- **Post-Middleware** (`post_middleware_node`) — walks the agent's message history for
+  `ToolMessage`s to report exactly which tools ran, merges their raw output, and formats the
+  final response. Any tool the planner skipped stays `None` in the output.
+
+No human-in-the-loop step is implemented in this version.
+
 ## How LangGraph is used here
 
-- `StateGraph(TravelState)` defines the graph over a typed state schema.
+- `StateGraph(TravelState)` / `StateGraph(DynamicPlannerState)` define each graph over a typed
+  state schema.
 - Nodes are plain async functions `(state) -> dict`; LangGraph merges the returned dict into
   the running state after each node.
-- `graph.add_conditional_edges(node, route, ROUTE_MAP)` is what makes this a *dynamic* pipeline
-  instead of a fixed sequence — the same `route()` function decides the next hop after
+- `graph.add_conditional_edges(node, route, ROUTE_MAP)` is what makes the fixed pipeline
+  *dynamic in ordering* — the same `route()` function decides the next hop after
   `update_state_node` and after each specialist, so the graph's actual path through the nodes
-  depends on the user's request.
-- `graph.compile()` produces a runnable `app`; `await app.ainvoke(initial_state)` runs it
-  end-to-end.
-- `create_agent(llm, [tool], system_prompt=..., middleware=[...])` (from `langchain.agents`)
-  builds each specialist as a minimal ReAct loop: the LLM decides when to call its one tool and
-  when to answer. This is the current, non-deprecated replacement for LangGraph's
+  depends on the user's request. The dynamic planner graph uses a much simpler conditional edge
+  (`route_after_pre_middleware`) that only branches on validation failure.
+- `graph.compile()` produces a runnable graph object (`app`, `dynamic_app`);
+  `await app.ainvoke(initial_state)` runs it end-to-end.
+- `create_agent(llm, [tools], system_prompt=..., middleware=[...])` (from `langchain.agents`)
+  builds each ReAct agent: the LLM decides when to call its tool(s) and when to answer. This is
+  the current, non-deprecated replacement for LangGraph's
   `langgraph.prebuilt.create_react_agent`.
+- Both graphs also accept a `messages` list (in addition to `raw_input`) so chat-style clients
+  — LangGraph Studio's Chat tab, Agent Chat, agent-chat-ui — work directly: the latest
+  `HumanMessage` becomes `raw_input` if not set explicitly, and the final node appends an
+  `AIMessage` summarizing `final_output` for the client to render.
 
 ## Middleware — summarization & message trimming
 
-Each specialist agent can call its tool more than once inside its own ReAct loop (e.g. retry
-after a bad query), and every call/response is appended to that agent's `messages` list. A
-shared `SummarizationMiddleware` (from `langchain.agents.middleware`) is attached to all three
-specialist agents to keep that list bounded:
+Every agent in both graphs (the three specialists, and the dynamic planner) can call its
+tool(s) more than once inside its own ReAct loop (e.g. retry after a bad query), and every
+call/response is appended to that agent's `messages` list. A shared `SummarizationMiddleware`
+(from `langchain.agents.middleware`) is attached to all of them to keep that list bounded:
 
 ```python
 summarization_middleware = SummarizationMiddleware(
@@ -84,37 +133,37 @@ summarization_middleware = SummarizationMiddleware(
 )
 ```
 
-Once a specialist's message history crosses the `trigger` threshold, the middleware asks the
-LLM to compress everything except the most recent `keep` messages into a single summary
-message. The original older messages are then **deleted** from state (via LangGraph's
-`RemoveMessage`) and replaced by that summary, so context stays bounded no matter how many
-tool-call round-trips a specialist takes — instead of growing unboundedly with every retry.
+Once an agent's message history crosses the `trigger` threshold, the middleware asks the LLM to
+compress everything except the most recent `keep` messages into a single summary message. The
+original older messages are then **deleted** from state (via LangGraph's `RemoveMessage`) and
+replaced by that summary, so context stays bounded no matter how many tool-call round-trips an
+agent takes — instead of growing unboundedly with every retry.
 
 ## Tools & integrations
 
-| Agent | Tool | Backing service | Offline fallback |
-|---|---|---|---|
-| Flights | `search_flights` | Kiwi MCP server (`https://mcp.kiwi.com`, via `langchain-mcp-adapters`) | Stub tool returning a canned string if the MCP server is unreachable or doesn't expose `search_flights` |
-| Venue | `search_venues` | Tavily web search | Stub message if `TAVILY_API_KEY` is missing |
-| Playlist | `query_playlist_db` | Local SQLite (`travel_agent.db`, table `songs`, seeded with sample tracks) | N/A — always available, no external dependency |
+| Tool | Backing service | Offline fallback |
+|---|---|---|
+| `search_flights` | Kiwi MCP server (`https://mcp.kiwi.com`, via `langchain-mcp-adapters`) | Stub response if the MCP server is unreachable or doesn't expose `search_flights`; the MCP tool is fetched lazily on first call so module import never blocks on network I/O |
+| `search_venues` | Tavily web search | Stub message if `TAVILY_API_KEY` is missing |
+| `query_playlist_db` | Local SQLite (`travel_agent.db`, table `songs`, seeded with sample tracks) | N/A — always available, no external dependency |
 
-The LLM itself is **Groq** (`ChatGroq`, model `llama-3.3-70b-versatile`), shared by the
-coordinator's extraction step and all three specialist agents.
+The LLM itself is **Groq** (`ChatGroq`, model `llama-3.3-70b-versatile`), shared by every
+extraction step and every agent in both graphs.
 
 **LangSmith** tracing is wired up via `LANGSMITH_TRACING` / `LANGSMITH_ENDPOINT` /
-`LANGSMITH_PROJECT` env vars — optional, disabled by default, useful for inspecting each
-node's LLM calls and tool calls in the LangSmith UI when enabled.
+`LANGSMITH_PROJECT` env vars — optional, disabled by default, useful for inspecting each node's
+LLM calls and tool calls in the LangSmith UI when enabled.
 
-Because every tool has a graceful fallback, the full graph can be exercised end-to-end with no
-API keys at all — you'll just get stubbed output instead of live flight/venue data.
+Because every tool has a graceful fallback, both graphs can be exercised end-to-end with no API
+keys at all — you'll just get stubbed output instead of live flight/venue data.
 
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+uv sync            # or: pip install -e .
 ```
 
-Fill in `.env` with real values:
+Fill in `.env` (copy from `.env.example`) with real values:
 
 ```
 GROQ_API_KEY=...       # required for any LLM call to succeed
@@ -122,12 +171,52 @@ TAVILY_API_KEY=...     # optional — enables live venue search
 LANGSMITH_API_KEY=...  # optional — enables LangSmith tracing
 ```
 
-Then open [notebook.ipynb](notebook.ipynb) and run all cells. Section 11 ("Test execution")
-shows an example end-to-end run.
+## Running & testing
+
+**Notebook** — open [notebook.ipynb](notebook.ipynb) and run all cells. Section 11 runs the
+fixed pipeline end-to-end; section 12 runs the dynamic planner.
+
+**LangGraph dev server** — serves both graphs over the LangGraph API:
+
+```bash
+langgraph dev --no-browser
+```
+
+This starts an in-memory API at `http://127.0.0.1:2024` (auto-reloads on changes to
+`travel_agent/graph.py`). From here you can:
+
+- Open **LangGraph Studio** at the printed `Studio UI` link. Browsers block secure pages like
+  `smith.langchain.com` from calling `http://localhost` directly, so if the connection fails,
+  restart with `langgraph dev --no-browser --tunnel` and use the printed `https://*.trycloudflare.com`
+  URL as the Studio "Base URL" instead. In Studio, pick `agent` or `dynamic_agent` from the
+  graph/assistant picker, expand the **Input** panel, and fill in **Raw Input** with your test
+  message.
+- Point any LangGraph-API-compatible chat client (e.g.
+  [Agent Chat](https://agentchat.vercel.app)) at `http://127.0.0.1:2024` with assistant ID
+  `agent` or `dynamic_agent`.
+
+**Local chat UI** (`agent-chat-ui/`) — a self-hosted alternative to the two options above, with
+no manual URL/ID entry:
+
+```bash
+cd agent-chat-ui
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`. Its `.env` is pre-configured with
+`NEXT_PUBLIC_API_URL=http://127.0.0.1:2024` and `NEXT_PUBLIC_ASSISTANT_ID=dynamic_agent` — edit
+the latter to `agent` to test the fixed pipeline instead, or override it in the app's settings
+screen. Requires `langgraph dev` running separately.
 
 ## Notes / known issues
 
-- The Kiwi MCP server currently doesn't expose a `search_flights` tool, so the flights agent
-  runs on the stub tool by default (visible as a `WARNING` in the section 4a output).
-- Field extraction relies on the LLM returning strict JSON; `update_state_node` has a
-  regex/keyword-based fallback (`_fallback_extraction`) for when it doesn't.
+- The Kiwi MCP server currently doesn't expose a `search_flights` tool, so the flights tool
+  runs on its stub fallback by default.
+- Field extraction relies on the LLM returning strict JSON; both graphs have a
+  regex/keyword-based fallback for when it doesn't (`_fallback_extraction` in the fixed
+  pipeline; a plain `{}` fallback in the dynamic planner, which then surfaces as a validation
+  error if no destination was extracted).
+- The sample playlist DB's seed genres are `jazz`/`pop`/`rock`/`electronic` — a request for
+  e.g. `EDM` will correctly call the tool but get "No songs found" back, since the genre string
+  doesn't match. Not a bug in the graph logic, just sparse seed data.

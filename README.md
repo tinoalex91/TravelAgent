@@ -41,7 +41,8 @@ update_state_node     (parses the JSON, merges fields into state, falls back to 
 
 - **Coordinator** = `extract_intent_node` + `update_state_node` + the `route()` function.
 - **Specialists** = `flights_node`, `venue_node`, `playlist_node` — each just calls its own
-  ReAct agent (`create_react_agent` from LangGraph's prebuilt module) bound to a single tool.
+  ReAct agent (`create_agent` from `langchain.agents`) bound to a single tool, with a shared
+  summarization middleware attached (see below).
 - **Router** (`route()`) is one function reused at every branch point. It walks a fixed
   pipeline order (`flights → venue → playlist`) and returns whichever intent was requested by
   the user and hasn't produced a result yet. Once every requested intent has a result, it sends
@@ -63,11 +64,31 @@ update_state_node     (parses the JSON, merges fields into state, falls back to 
   depends on the user's request.
 - `graph.compile()` produces a runnable `app`; `await app.ainvoke(initial_state)` runs it
   end-to-end.
-- `create_react_agent(llm, [tool], prompt=...)` (from `langgraph.prebuilt`) builds each
-  specialist as a minimal ReAct loop: the LLM decides when to call its one tool and when to
-  answer. Note: this notebook uses the LangGraph-prebuilt version, which is deprecated as of
-  LangGraph v1.0 in favor of `langchain.agents.create_agent` — see
-  [Notes / known issues](#notes--known-issues).
+- `create_agent(llm, [tool], system_prompt=..., middleware=[...])` (from `langchain.agents`)
+  builds each specialist as a minimal ReAct loop: the LLM decides when to call its one tool and
+  when to answer. This is the current, non-deprecated replacement for LangGraph's
+  `langgraph.prebuilt.create_react_agent`.
+
+## Middleware — summarization & message trimming
+
+Each specialist agent can call its tool more than once inside its own ReAct loop (e.g. retry
+after a bad query), and every call/response is appended to that agent's `messages` list. A
+shared `SummarizationMiddleware` (from `langchain.agents.middleware`) is attached to all three
+specialist agents to keep that list bounded:
+
+```python
+summarization_middleware = SummarizationMiddleware(
+    model=llm,
+    trigger=("messages", 12),   # start summarizing once history passes 12 messages
+    keep=("messages", 6),       # always keep the 6 most recent messages verbatim
+)
+```
+
+Once a specialist's message history crosses the `trigger` threshold, the middleware asks the
+LLM to compress everything except the most recent `keep` messages into a single summary
+message. The original older messages are then **deleted** from state (via LangGraph's
+`RemoveMessage`) and replaced by that summary, so context stays bounded no matter how many
+tool-call round-trips a specialist takes — instead of growing unboundedly with every retry.
 
 ## Tools & integrations
 
@@ -106,9 +127,6 @@ shows an example end-to-end run.
 
 ## Notes / known issues
 
-- `create_react_agent` currently emits a `LangGraphDeprecatedSinceV10` warning — LangGraph
-  moved it to `langchain.agents.create_agent` ahead of a v2.0 removal. The notebook still works
-  as-is; migrating the three `create_react_agent(...)` calls in section 5 is a future cleanup.
 - The Kiwi MCP server currently doesn't expose a `search_flights` tool, so the flights agent
   runs on the stub tool by default (visible as a `WARNING` in the section 4a output).
 - Field extraction relies on the LLM returning strict JSON; `update_state_node` has a
